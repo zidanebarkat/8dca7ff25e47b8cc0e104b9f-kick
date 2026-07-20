@@ -1,0 +1,8 @@
+*cookies*.json
+*token*.json
+*session*.json
+config.json
+.env
+__pycache__/
+*.pyc
+/tmp/

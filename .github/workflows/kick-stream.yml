@@ -1,0 +1,137 @@
+name: Kick.com Loop Streamer
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Start or stop the stream"
+        required: true
+        default: "start"
+        type: choice
+        options:
+          - start
+          - stop
+      stream_key:
+        description: "Kick.com stream key"
+        required: false
+        type: string
+      video_url:
+        description: "Video URL to loop (mp4/m3u8)"
+        required: false
+        type: string
+      kick_rtmp:
+        description: "Kick RTMP URL"
+        required: false
+        default: "rtmp://push.kick.com/live"
+        type: string
+      retrigger_hours:
+        description: "Hours before self-retrigger (0=disabled, max 5.5)"
+        required: false
+        default: "5"
+        type: string
+
+jobs:
+  stream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        if: inputs.action == 'start'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg curl
+
+      - name: Stop existing stream
+        if: inputs.action == 'stop'
+        run: |
+          echo "Stopping all FFmpeg processes..."
+          pkill -f "ffmpeg.*push.kick.com" 2>/dev/null || true
+          touch /tmp/kick-stream.stop
+          echo "Stream stopped."
+
+      - name: Download video
+        if: inputs.action == 'start'
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+        run: |
+          mkdir -p /tmp/kick-stream
+          rm -f /tmp/kick-stream/video.mp4 /tmp/kick-stream.stop
+          echo "Downloading video: $VIDEO_URL"
+          if [[ "$VIDEO_URL" == *.m3u8 ]]; then
+            ffmpeg -y -i "$VIDEO_URL" -c copy /tmp/kick-stream/video.mp4
+          else
+            curl -L -o /tmp/kick-stream/video.mp4 "$VIDEO_URL"
+          fi
+          ls -lh /tmp/kick-stream/video.mp4
+
+      - name: Stream to Kick.com (loop + auto-restart)
+        if: inputs.action == 'start'
+        env:
+          KICK_RTMP: ${{ inputs.kick_rtmp }}
+          KICK_STREAM_KEY: ${{ inputs.stream_key }}
+          RETRIGGER_HOURS: ${{ inputs.retrigger_hours }}
+        run: |
+          chmod +x restream.sh
+
+          RETRIGGER_SECS=$((${RETRIGGER_HOURS:-5} * 3600))
+          START_TIME=$(date +%s)
+
+          echo "========================================="
+          echo " Kick.com Loop Streamer"
+          echo " RTMP:  ${KICK_RTMP}"
+          echo " Video: ${{ inputs.video_url }}"
+          echo " Retrigger every: ${RETRIGGER_HOURS}h"
+          echo "========================================="
+
+          while true; do
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - START_TIME))
+
+            if [[ $RETRIGGER_SECS -gt 0 && $ELAPSED -ge $RETRIGGER_SECS ]]; then
+              echo "Retrigger threshold reached (${RETRIGGER_HOURS}h). Re-dispatching workflow..."
+              curl -X POST \
+                -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow_id }}/dispatches" \
+                -d "{\"ref\":\"${{ github.ref_name }}\",\"inputs\":{\"action\":\"start\",\"stream_key\":\"${{ inputs.stream_key }}\",\"video_url\":\"${{ inputs.video_url }}\",\"kick_rtmp\":\"${{ inputs.kick_rtmp }}\",\"retrigger_hours\":\"${{ inputs.retrigger_hours }}\"}}"
+              echo "Re-dispatch sent. This run will now stop."
+              exit 0
+            fi
+
+            if [[ -f /tmp/kick-stream.stop ]]; then
+              echo "Stop file detected. Exiting."
+              break
+            fi
+
+            echo "[$(date)] Starting FFmpeg stream..."
+            ffmpeg -re -stream_loop -1 \
+              -i /tmp/kick-stream/video.mp4 \
+              -c:v libx264 -preset veryfast -b:v 4500k -maxrate 4500k -bufsize 9000k \
+              -s 1920x1080 -r 30 \
+              -c:a aac -b:a 128k -ar 44100 \
+              -f flv "${KICK_RTMP}/${KICK_STREAM_KEY}" &
+            FF_PID=$!
+
+            wait $FF_PID || true
+            EXIT_CODE=$?
+
+            if [[ -f /tmp/kick-stream.stop ]]; then
+              echo "Stop file detected after FFmpeg exit."
+              break
+            fi
+
+            echo "[$(date)] FFmpeg exited (code $EXIT_CODE). Restarting in 5s..."
+            sleep 5
+          done
+
+          echo "Stream ended."
+
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -f "ffmpeg.*push.kick.com" 2>/dev/null || true
+          echo "Cleanup done."
