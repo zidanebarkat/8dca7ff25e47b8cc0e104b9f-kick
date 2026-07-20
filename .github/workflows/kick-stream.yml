@@ -16,7 +16,7 @@ on:
         required: false
         type: string
       video_url:
-        description: "Video URL to loop (mp4/m3u8/twitch/youtube)"
+        description: "Video URL (twitch/youtube/mp4/m3u8)"
         required: false
         type: string
       kick_username:
@@ -43,79 +43,59 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg curl
-          pip install yt-dlp websocket-client
+          pip install streamlink websocket-client
 
       - name: Stop existing stream
         if: inputs.action == 'stop'
         run: |
           echo "Stopping all processes..."
           pkill -f "ffmpeg" 2>/dev/null || true
+          pkill -f "streamlink" 2>/dev/null || true
           pkill -f "get_followers.py" 2>/dev/null || true
           pkill -f "get_chat.py" 2>/dev/null || true
+          pkill -f "chunked_stream.py" 2>/dev/null || true
           touch /tmp/kick-stream.stop
           echo "Stream stopped."
 
-      - name: Download video
+      - name: Prepare output URL
         if: inputs.action == 'start'
-        env:
-          VIDEO_URL: ${{ inputs.video_url }}
+        id: output
         run: |
-          mkdir -p /tmp/kick-stream
-          rm -f /tmp/kick-stream/video.mp4 /tmp/kick-stream.stop
-          echo "Downloading video: $VIDEO_URL"
-
-          if [[ "$VIDEO_URL" == *twitch.tv* ]] || [[ "$VIDEO_URL" == *youtube.com* ]] || [[ "$VIDEO_URL" == *youtu.be* ]]; then
-            echo "Using yt-dlp..."
-            yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
-              --merge-output-format mp4 \
-              -o /tmp/kick-stream/video.mp4 "$VIDEO_URL"
-          elif [[ "$VIDEO_URL" == *.m3u8 ]]; then
-            ffmpeg -y -i "$VIDEO_URL" -c copy /tmp/kick-stream/video.mp4
+          KEY="${{ inputs.stream_key }}"
+          if [[ "$KEY" == srt://* ]]; then
+            echo "type=srt" >> $GITHUB_OUTPUT
+            echo "url=$KEY" >> $GITHUB_OUTPUT
           else
-            curl -L -o /tmp/kick-stream/video.mp4 "$VIDEO_URL"
+            echo "type=rtmp" >> $GITHUB_OUTPUT
+            echo "url=rtmp://push.kick.com/live/$KEY" >> $GITHUB_OUTPUT
           fi
-
-          ls -lh /tmp/kick-stream/video.mp4
 
       - name: Start follower tracker
         if: inputs.action == 'start' && inputs.kick_username != ''
         run: |
+          mkdir -p /tmp/kick-stream
           echo "LIVE" > /tmp/kick-stream/follower_count.txt
           python3 get_followers.py "${{ inputs.kick_username }}" /tmp/kick-stream/follower_count.txt &
-          echo "Follower tracker started for: ${{ inputs.kick_username }}"
 
       - name: Start chat tracker
         if: inputs.action == 'start' && inputs.kick_username != ''
         run: |
+          mkdir -p /tmp/kick-stream
           : > /tmp/kick-stream/chat_messages.txt
           python3 get_chat.py "${{ inputs.kick_username }}" /tmp/kick-stream/chat_messages.txt &
-          echo "Chat tracker started for: ${{ inputs.kick_username }}"
 
-      - name: Stream to Kick.com (loop + auto-restart)
+      - name: Stream to Kick.com (chunked download + loop)
         if: inputs.action == 'start'
         env:
-          KICK_STREAM_KEY: ${{ inputs.stream_key }}
+          OUTPUT_URL: ${{ steps.output.outputs.url }}
+          OUTPUT_TYPE: ${{ steps.output.outputs.type }}
           KICK_USERNAME: ${{ inputs.kick_username }}
           RETRIGGER_HOURS: ${{ inputs.retrigger_hours }}
         run: |
-          chmod +x restream.sh get_followers.py get_chat.py
+          chmod +x chunked_stream.py get_followers.py get_chat.py
 
           RETRIGGER_SECS=$((${RETRIGGER_HOURS:-5} * 3600))
           START_TIME=$(date +%s)
-
-          if [[ "$KICK_STREAM_KEY" == srt://* ]]; then
-            OUTPUT_TYPE="SRT"
-          else
-            OUTPUT_TYPE="RTMP"
-          fi
-
-          echo "========================================="
-          echo " Kick.com Loop Streamer"
-          echo " Output:  ${OUTPUT_TYPE}"
-          echo " Video:   ${{ inputs.video_url }}"
-          echo " User:    ${KICK_USERNAME:-none}"
-          echo " Retrigger every: ${RETRIGGER_HOURS}h"
-          echo "========================================="
 
           FOLLOWER_FILE="/tmp/kick-stream/follower_count.txt"
           CHAT_FILE="/tmp/kick-stream/chat_messages.txt"
@@ -124,11 +104,18 @@ jobs:
 
           DRAWTEXT="drawtext=textfile=${FOLLOWER_FILE}:reload=30:fontcolor=white:fontsize=28:font=Sans:x=20:y=20:box=1:boxcolor=black@0.6:boxborderw=12,drawtext=textfile=${CHAT_FILE}:reload=5:fontcolor=white:fontsize=22:font=Sans:x=w-tw-20:y=h-th-20:box=1:boxcolor=black@0.7:boxborderw=10"
 
-          if [[ "$KICK_STREAM_KEY" == srt://* ]]; then
-            OUTPUT_ARGS="-f mpegts ${KICK_STREAM_KEY}"
-          else
-            OUTPUT_ARGS="-f flv rtmp://push.kick.com/live/${KICK_STREAM_KEY}"
-          fi
+          export OVERLAY_FILTER="$DRAWTEXT"
+
+          echo "========================================="
+          echo " Kick.com Chunked Streamer"
+          echo " Output:  ${{ steps.output.outputs.type }}"
+          echo " Video:   ${{ inputs.video_url }}"
+          echo " User:    ${KICK_USERNAME:-none}"
+          echo " Mode:    30-min chunks, no gaps"
+          echo "========================================="
+
+          rm -f /tmp/kick-stream.stop
+          mkdir -p /tmp/kick-stream/chunks
 
           while true; do
             CURRENT_TIME=$(date +%s)
@@ -150,25 +137,21 @@ jobs:
               break
             fi
 
-            echo "[$(date)] Starting FFmpeg stream..."
-            eval ffmpeg -re -stream_loop -1 \
-              -i /tmp/kick-stream/video.mp4 \
-              -vf "\"${DRAWTEXT}\"" \
-              -c:v libx264 -preset veryfast -b:v 4500k -maxrate 4500k -bufsize 9000k \
-              -s 1920x1080 -r 30 \
-              -c:a aac -b:a 128k -ar 44100 \
-              $OUTPUT_ARGS &
-            FF_PID=$!
-
-            wait $FF_PID || true
+            echo "[$(date)] Starting chunked stream..."
+            python3 chunked_stream.py "${{ inputs.video_url }}" "$OUTPUT_URL"
             EXIT_CODE=$?
 
             if [[ -f /tmp/kick-stream.stop ]]; then
-              echo "Stop file detected after FFmpeg exit."
+              echo "Stop file detected after stream exit."
               break
             fi
 
-            echo "[$(date)] FFmpeg exited (code $EXIT_CODE). Restarting in 5s..."
+            if [[ $EXIT_CODE -eq 0 ]]; then
+              echo "[$(date)] Stream completed normally."
+              break
+            fi
+
+            echo "[$(date)] Stream exited (code $EXIT_CODE). Restarting in 5s..."
             sleep 5
           done
 
@@ -178,6 +161,8 @@ jobs:
         if: always()
         run: |
           pkill -f "ffmpeg" 2>/dev/null || true
+          pkill -f "streamlink" 2>/dev/null || true
           pkill -f "get_followers.py" 2>/dev/null || true
           pkill -f "get_chat.py" 2>/dev/null || true
+          pkill -f "chunked_stream.py" 2>/dev/null || true
           echo "Cleanup done."
