@@ -9,21 +9,29 @@ VIDEO_DIR="/tmp/kick-stream"
 VIDEO_FILE="$VIDEO_DIR/video.mp4"
 STOP_FILE="/tmp/kick-stream.stop"
 FOLLOWER_FILE="$VIDEO_DIR/follower_count.txt"
+CHAT_FILE="$VIDEO_DIR/chat_messages.txt"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAX_RESTARTS=0
 RESTART_DELAY=5
 
 mkdir -p "$VIDEO_DIR"
 echo "LIVE" > "$FOLLOWER_FILE"
+: > "$CHAT_FILE"
 rm -f "$STOP_FILE"
+
+PIDS=()
 
 cleanup() {
     echo "[kick] Shutting down..."
     touch "$STOP_FILE"
-    kill "$FF_PID" 2>/dev/null || true
-    kill "$FOLLOWER_PID" 2>/dev/null || true
-    wait "$FF_PID" 2>/dev/null || true
-    wait "$FOLLOWER_PID" 2>/dev/null || true
+    for pid in "${PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in "${PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    pkill -f "get_followers.py" 2>/dev/null || true
+    pkill -f "get_chat.py" 2>/dev/null || true
 }
 trap cleanup SIGTERM SIGINT SIGHUP
 
@@ -43,19 +51,26 @@ start_follower_tracker() {
     if [[ -n "$KICK_USERNAME" ]]; then
         echo "[kick] Starting follower tracker for: $KICK_USERNAME"
         python3 "$SCRIPT_DIR/get_followers.py" "$KICK_USERNAME" "$FOLLOWER_FILE" &
-        FOLLOWER_PID=$!
+        PIDS+=($!)
     else
-        echo "0" > "$FOLLOWER_FILE"
-        FOLLOWER_PID=""
+        echo "LIVE" > "$FOLLOWER_FILE"
+    fi
+}
+
+start_chat_tracker() {
+    if [[ -n "$KICK_USERNAME" ]]; then
+        echo "[kick] Starting chat tracker for: $KICK_USERNAME"
+        python3 "$SCRIPT_DIR/get_chat.py" "$KICK_USERNAME" "$CHAT_FILE" &
+        PIDS+=($!)
     fi
 }
 
 build_drawtext_filter() {
-    local bg="rgba(0,0,0,0.6)"
-    local fg="white"
-    local fontfile=""
+    local follower_filter="drawtext=textfile=${FOLLOWER_FILE}:reload=30:fontcolor=white:fontsize=28:font=Sans:x=20:y=20:box=1:boxcolor=black@0.6:boxborderw=12"
 
-    echo "drawtext=textfile=${FOLLOWER_FILE}:reload=30:fontcolor=${fg}:fontsize=28:font=Sans:x=20:y=20:box=1:boxcolor=${bg}:boxborderw=12"
+    local chat_filter="drawtext=textfile=${CHAT_FILE}:reload=5:fontcolor=white:fontsize=22:font=Sans:x=w-tw-20:y=h-th-20:box=1:boxcolor=black@0.7:boxborderw=10"
+
+    echo "${follower_filter},${chat_filter}"
 }
 
 stream_loop() {
@@ -78,9 +93,12 @@ stream_loop() {
             -c:a aac -b:a 128k -ar 44100 \
             -f flv "${KICK_RTMP}/${KICK_STREAM_KEY}" &
         FF_PID=$!
+        PIDS+=($!)
 
         wait "$FF_PID" || true
         EXIT_CODE=$?
+
+        PIDS=("${PIDS[@]/$FF_PID/}")
 
         if [[ -f "$STOP_FILE" ]]; then
             echo "[kick] Stop file detected after FFmpeg exit."
@@ -107,7 +125,8 @@ echo "========================================="
 
 download_video
 start_follower_tracker
+start_chat_tracker
 stream_loop
 
 echo "[kick] Stream ended."
-kill "$FOLLOWER_PID" 2>/dev/null || true
+cleanup

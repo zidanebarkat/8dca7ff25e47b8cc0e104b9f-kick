@@ -20,7 +20,7 @@ on:
         required: false
         type: string
       kick_username:
-        description: "Kick username (for follower counter overlay)"
+        description: "Kick username (for follower counter + chat overlay)"
         required: false
         type: string
       kick_rtmp:
@@ -48,13 +48,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg curl
+          pip install websocket-client
 
       - name: Stop existing stream
         if: inputs.action == 'stop'
         run: |
-          echo "Stopping all FFmpeg processes..."
+          echo "Stopping all processes..."
           pkill -f "ffmpeg.*push.kick.com" 2>/dev/null || true
           pkill -f "get_followers.py" 2>/dev/null || true
+          pkill -f "get_chat.py" 2>/dev/null || true
           touch /tmp/kick-stream.stop
           echo "Stream stopped."
 
@@ -80,6 +82,13 @@ jobs:
           python3 get_followers.py "${{ inputs.kick_username }}" /tmp/kick-stream/follower_count.txt &
           echo "Follower tracker started for: ${{ inputs.kick_username }}"
 
+      - name: Start chat tracker
+        if: inputs.action == 'start' && inputs.kick_username != ''
+        run: |
+          : > /tmp/kick-stream/chat_messages.txt
+          python3 get_chat.py "${{ inputs.kick_username }}" /tmp/kick-stream/chat_messages.txt &
+          echo "Chat tracker started for: ${{ inputs.kick_username }}"
+
       - name: Stream to Kick.com (loop + auto-restart)
         if: inputs.action == 'start'
         env:
@@ -88,8 +97,7 @@ jobs:
           KICK_USERNAME: ${{ inputs.kick_username }}
           RETRIGGER_HOURS: ${{ inputs.retrigger_hours }}
         run: |
-          chmod +x restream.sh
-          chmod +x get_followers.py
+          chmod +x restream.sh get_followers.py get_chat.py
 
           RETRIGGER_SECS=$((${RETRIGGER_HOURS:-5} * 3600))
           START_TIME=$(date +%s)
@@ -103,11 +111,12 @@ jobs:
           echo "========================================="
 
           FOLLOWER_FILE="/tmp/kick-stream/follower_count.txt"
-          if [[ ! -f "$FOLLOWER_FILE" ]]; then
-            echo "LIVE" > "$FOLLOWER_FILE"
-          fi
+          CHAT_FILE="/tmp/kick-stream/chat_messages.txt"
 
-          DRAWTEXT="drawtext=textfile=${FOLLOWER_FILE}:reload=30:fontcolor=white:fontsize=28:font=Sans:x=20:y=20:box=1:boxcolor=black@0.6:boxborderw=12"
+          [[ ! -f "$FOLLOWER_FILE" ]] && echo "LIVE" > "$FOLLOWER_FILE"
+          [[ ! -f "$CHAT_FILE" ]] && : > "$CHAT_FILE"
+
+          DRAWTEXT="drawtext=textfile=${FOLLOWER_FILE}:reload=30:fontcolor=white:fontsize=28:font=Sans:x=20:y=20:box=1:boxcolor=black@0.6:boxborderw=12,drawtext=textfile=${CHAT_FILE}:reload=5:fontcolor=white:fontsize=22:font=Sans:x=w-tw-20:y=h-th-20:box=1:boxcolor=black@0.7:boxborderw=10"
 
           while true; do
             CURRENT_TIME=$(date +%s)
@@ -158,4 +167,5 @@ jobs:
         run: |
           pkill -f "ffmpeg.*push.kick.com" 2>/dev/null || true
           pkill -f "get_followers.py" 2>/dev/null || true
+          pkill -f "get_chat.py" 2>/dev/null || true
           echo "Cleanup done."

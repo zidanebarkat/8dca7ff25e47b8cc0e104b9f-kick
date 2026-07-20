@@ -9,8 +9,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py restream.sh get_followers.py ./
-RUN chmod +x restream.sh get_followers.py
+COPY app.py restream.sh get_followers.py get_chat.py ./
+RUN chmod +x restream.sh get_followers.py get_chat.py
 
 EXPOSE 8080
 
