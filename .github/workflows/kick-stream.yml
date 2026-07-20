@@ -12,21 +12,16 @@ on:
           - start
           - stop
       stream_key:
-        description: "Kick.com stream key"
+        description: "Kick stream key or full SRT URL"
         required: false
         type: string
       video_url:
-        description: "Video URL to loop (mp4/m3u8)"
+        description: "Video URL to loop (mp4/m3u8/twitch/youtube)"
         required: false
         type: string
       kick_username:
         description: "Kick username (for follower counter + chat overlay)"
         required: false
-        type: string
-      kick_rtmp:
-        description: "Kick RTMP URL"
-        required: false
-        default: "rtmp://push.kick.com/live"
         type: string
       retrigger_hours:
         description: "Hours before self-retrigger (0=disabled, max 5.5)"
@@ -48,13 +43,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg curl
-          pip install websocket-client
+          pip install yt-dlp websocket-client
 
       - name: Stop existing stream
         if: inputs.action == 'stop'
         run: |
           echo "Stopping all processes..."
-          pkill -f "ffmpeg.*push.kick.com" 2>/dev/null || true
+          pkill -f "ffmpeg" 2>/dev/null || true
           pkill -f "get_followers.py" 2>/dev/null || true
           pkill -f "get_chat.py" 2>/dev/null || true
           touch /tmp/kick-stream.stop
@@ -68,11 +63,18 @@ jobs:
           mkdir -p /tmp/kick-stream
           rm -f /tmp/kick-stream/video.mp4 /tmp/kick-stream.stop
           echo "Downloading video: $VIDEO_URL"
-          if [[ "$VIDEO_URL" == *.m3u8 ]]; then
+
+          if [[ "$VIDEO_URL" == *twitch.tv* ]] || [[ "$VIDEO_URL" == *youtube.com* ]] || [[ "$VIDEO_URL" == *youtu.be* ]]; then
+            echo "Using yt-dlp..."
+            yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
+              --merge-output-format mp4 \
+              -o /tmp/kick-stream/video.mp4 "$VIDEO_URL"
+          elif [[ "$VIDEO_URL" == *.m3u8 ]]; then
             ffmpeg -y -i "$VIDEO_URL" -c copy /tmp/kick-stream/video.mp4
           else
             curl -L -o /tmp/kick-stream/video.mp4 "$VIDEO_URL"
           fi
+
           ls -lh /tmp/kick-stream/video.mp4
 
       - name: Start follower tracker
@@ -92,7 +94,6 @@ jobs:
       - name: Stream to Kick.com (loop + auto-restart)
         if: inputs.action == 'start'
         env:
-          KICK_RTMP: ${{ inputs.kick_rtmp }}
           KICK_STREAM_KEY: ${{ inputs.stream_key }}
           KICK_USERNAME: ${{ inputs.kick_username }}
           RETRIGGER_HOURS: ${{ inputs.retrigger_hours }}
@@ -102,21 +103,32 @@ jobs:
           RETRIGGER_SECS=$((${RETRIGGER_HOURS:-5} * 3600))
           START_TIME=$(date +%s)
 
+          if [[ "$KICK_STREAM_KEY" == srt://* ]]; then
+            OUTPUT_TYPE="SRT"
+          else
+            OUTPUT_TYPE="RTMP"
+          fi
+
           echo "========================================="
           echo " Kick.com Loop Streamer"
-          echo " RTMP:  ${KICK_RTMP}"
-          echo " Video: ${{ inputs.video_url }}"
-          echo " User:  ${KICK_USERNAME:-none}"
+          echo " Output:  ${OUTPUT_TYPE}"
+          echo " Video:   ${{ inputs.video_url }}"
+          echo " User:    ${KICK_USERNAME:-none}"
           echo " Retrigger every: ${RETRIGGER_HOURS}h"
           echo "========================================="
 
           FOLLOWER_FILE="/tmp/kick-stream/follower_count.txt"
           CHAT_FILE="/tmp/kick-stream/chat_messages.txt"
-
           [[ ! -f "$FOLLOWER_FILE" ]] && echo "LIVE" > "$FOLLOWER_FILE"
           [[ ! -f "$CHAT_FILE" ]] && : > "$CHAT_FILE"
 
           DRAWTEXT="drawtext=textfile=${FOLLOWER_FILE}:reload=30:fontcolor=white:fontsize=28:font=Sans:x=20:y=20:box=1:boxcolor=black@0.6:boxborderw=12,drawtext=textfile=${CHAT_FILE}:reload=5:fontcolor=white:fontsize=22:font=Sans:x=w-tw-20:y=h-th-20:box=1:boxcolor=black@0.7:boxborderw=10"
+
+          if [[ "$KICK_STREAM_KEY" == srt://* ]]; then
+            OUTPUT_ARGS="-f mpegts ${KICK_STREAM_KEY}"
+          else
+            OUTPUT_ARGS="-f flv rtmp://push.kick.com/live/${KICK_STREAM_KEY}"
+          fi
 
           while true; do
             CURRENT_TIME=$(date +%s)
@@ -128,7 +140,7 @@ jobs:
                 -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow_id }}/dispatches" \
-                -d "{\"ref\":\"${{ github.ref_name }}\",\"inputs\":{\"action\":\"start\",\"stream_key\":\"${{ inputs.stream_key }}\",\"video_url\":\"${{ inputs.video_url }}\",\"kick_username\":\"${{ inputs.kick_username }}\",\"kick_rtmp\":\"${{ inputs.kick_rtmp }}\",\"retrigger_hours\":\"${{ inputs.retrigger_hours }}\"}}"
+                -d "{\"ref\":\"${{ github.ref_name }}\",\"inputs\":{\"action\":\"start\",\"stream_key\":\"${{ inputs.stream_key }}\",\"video_url\":\"${{ inputs.video_url }}\",\"kick_username\":\"${{ inputs.kick_username }}\",\"retrigger_hours\":\"${{ inputs.retrigger_hours }}\"}}"
               echo "Re-dispatch sent. This run will now stop."
               exit 0
             fi
@@ -139,13 +151,13 @@ jobs:
             fi
 
             echo "[$(date)] Starting FFmpeg stream..."
-            ffmpeg -re -stream_loop -1 \
+            eval ffmpeg -re -stream_loop -1 \
               -i /tmp/kick-stream/video.mp4 \
-              -vf "$DRAWTEXT" \
+              -vf "\"${DRAWTEXT}\"" \
               -c:v libx264 -preset veryfast -b:v 4500k -maxrate 4500k -bufsize 9000k \
               -s 1920x1080 -r 30 \
               -c:a aac -b:a 128k -ar 44100 \
-              -f flv "${KICK_RTMP}/${KICK_STREAM_KEY}" &
+              $OUTPUT_ARGS &
             FF_PID=$!
 
             wait $FF_PID || true
@@ -165,7 +177,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          pkill -f "ffmpeg.*push.kick.com" 2>/dev/null || true
+          pkill -f "ffmpeg" 2>/dev/null || true
           pkill -f "get_followers.py" 2>/dev/null || true
           pkill -f "get_chat.py" 2>/dev/null || true
           echo "Cleanup done."

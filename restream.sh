@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-KICK_RTMP="${KICK_RTMP:-rtmp://push.kick.com/live}"
-KICK_STREAM_KEY="${1:?Usage: $0 <stream_key> <video_url> [kick_username]}"
-VIDEO_URL="${2:?Usage: $0 <stream_key> <video_url> [kick_username]}"
+KICK_STREAM_KEY="${1:?Usage: $0 <stream_key_or_srt_url> <video_url> [kick_username]}"
+VIDEO_URL="${2:?Usage: $0 <stream_key_or_srt_url> <video_url> [kick_username]}"
 KICK_USERNAME="${3:-}"
 VIDEO_DIR="/tmp/kick-stream"
 VIDEO_FILE="$VIDEO_DIR/video.mp4"
@@ -35,10 +34,23 @@ cleanup() {
 }
 trap cleanup SIGTERM SIGINT SIGHUP
 
+is_srt() {
+    [[ "$KICK_STREAM_KEY" == srt://* ]]
+}
+
 download_video() {
     echo "[kick] Downloading video: $VIDEO_URL"
     rm -f "$VIDEO_FILE" "$VIDEO_FILE.part"
-    if [[ "$VIDEO_URL" =~ \.m3u8 ]]; then
+    if command -v yt-dlp &>/dev/null && [[ "$VIDEO_URL" =~ (twitch\.tv|youtube\.com|youtu\.be) ]]; then
+        echo "[kick] Using yt-dlp for platform URL..."
+        yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
+            --merge-output-format mp4 \
+            -o "$VIDEO_FILE" "$VIDEO_URL" 2>&1 || {
+            echo "[kick] yt-dlp failed, trying direct download..."
+            curl -L -o "$VIDEO_FILE.part" "$VIDEO_URL" 2>&1
+            mv "$VIDEO_FILE.part" "$VIDEO_FILE"
+        }
+    elif [[ "$VIDEO_URL" =~ \.m3u8 ]]; then
         ffmpeg -y -i "$VIDEO_URL" -c copy "$VIDEO_FILE" 2>&1
     else
         curl -L -o "$VIDEO_FILE.part" "$VIDEO_URL" 2>&1
@@ -67,16 +79,25 @@ start_chat_tracker() {
 
 build_drawtext_filter() {
     local follower_filter="drawtext=textfile=${FOLLOWER_FILE}:reload=30:fontcolor=white:fontsize=28:font=Sans:x=20:y=20:box=1:boxcolor=black@0.6:boxborderw=12"
-
     local chat_filter="drawtext=textfile=${CHAT_FILE}:reload=5:fontcolor=white:fontsize=22:font=Sans:x=w-tw-20:y=h-th-20:box=1:boxcolor=black@0.7:boxborderw=10"
-
     echo "${follower_filter},${chat_filter}"
+}
+
+build_output_args() {
+    if is_srt; then
+        echo "-f mpegts ${KICK_STREAM_KEY}"
+    else
+        KICK_RTMP="${KICK_RTMP:-rtmp://push.kick.com/live}"
+        echo "-f flv ${KICK_RTMP}/${KICK_STREAM_KEY}"
+    fi
 }
 
 stream_loop() {
     local restarts=0
     local drawtext_filter
+    local output_args
     drawtext_filter=$(build_drawtext_filter)
+    output_args=$(build_output_args)
 
     while true; do
         if [[ -f "$STOP_FILE" ]]; then
@@ -85,13 +106,14 @@ stream_loop() {
         fi
 
         echo "[kick] Starting FFmpeg stream (attempt $((restarts + 1)))..."
-        ffmpeg -re -stream_loop -1 \
+        echo "[kick] Output: $(if is_srt; then echo 'SRT'; else echo 'RTMP'; fi)"
+        eval ffmpeg -re -stream_loop -1 \
             -i "$VIDEO_FILE" \
-            -vf "$drawtext_filter" \
+            -vf "\"$drawtext_filter\"" \
             -c:v libx264 -preset veryfast -b:v 4500k -maxrate 4500k -bufsize 9000k \
             -s 1920x1080 -r 30 \
             -c:a aac -b:a 128k -ar 44100 \
-            -f flv "${KICK_RTMP}/${KICK_STREAM_KEY}" &
+            $output_args &
         FF_PID=$!
         PIDS+=($!)
 
@@ -118,9 +140,9 @@ stream_loop() {
 
 echo "========================================="
 echo " Kick.com Loop Streamer"
-echo " Stream:  ${KICK_RTMP}/<key>"
-echo " Video:   ${VIDEO_URL}"
-echo " Channel: ${KICK_USERNAME:-none}"
+echo " Protocol: $(if is_srt; then echo 'SRT'; else echo 'RTMP'; fi)"
+echo " Video:    ${VIDEO_URL}"
+echo " Channel:  ${KICK_USERNAME:-none}"
 echo "========================================="
 
 download_video
