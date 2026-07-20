@@ -19,6 +19,10 @@ on:
         description: "Video URL to loop (mp4/m3u8)"
         required: false
         type: string
+      kick_username:
+        description: "Kick username (for follower counter overlay)"
+        required: false
+        type: string
       kick_rtmp:
         description: "Kick RTMP URL"
         required: false
@@ -50,6 +54,7 @@ jobs:
         run: |
           echo "Stopping all FFmpeg processes..."
           pkill -f "ffmpeg.*push.kick.com" 2>/dev/null || true
+          pkill -f "get_followers.py" 2>/dev/null || true
           touch /tmp/kick-stream.stop
           echo "Stream stopped."
 
@@ -68,14 +73,23 @@ jobs:
           fi
           ls -lh /tmp/kick-stream/video.mp4
 
+      - name: Start follower tracker
+        if: inputs.action == 'start' && inputs.kick_username != ''
+        run: |
+          echo "LIVE" > /tmp/kick-stream/follower_count.txt
+          python3 get_followers.py "${{ inputs.kick_username }}" /tmp/kick-stream/follower_count.txt &
+          echo "Follower tracker started for: ${{ inputs.kick_username }}"
+
       - name: Stream to Kick.com (loop + auto-restart)
         if: inputs.action == 'start'
         env:
           KICK_RTMP: ${{ inputs.kick_rtmp }}
           KICK_STREAM_KEY: ${{ inputs.stream_key }}
+          KICK_USERNAME: ${{ inputs.kick_username }}
           RETRIGGER_HOURS: ${{ inputs.retrigger_hours }}
         run: |
           chmod +x restream.sh
+          chmod +x get_followers.py
 
           RETRIGGER_SECS=$((${RETRIGGER_HOURS:-5} * 3600))
           START_TIME=$(date +%s)
@@ -84,8 +98,16 @@ jobs:
           echo " Kick.com Loop Streamer"
           echo " RTMP:  ${KICK_RTMP}"
           echo " Video: ${{ inputs.video_url }}"
+          echo " User:  ${KICK_USERNAME:-none}"
           echo " Retrigger every: ${RETRIGGER_HOURS}h"
           echo "========================================="
+
+          FOLLOWER_FILE="/tmp/kick-stream/follower_count.txt"
+          if [[ ! -f "$FOLLOWER_FILE" ]]; then
+            echo "LIVE" > "$FOLLOWER_FILE"
+          fi
+
+          DRAWTEXT="drawtext=textfile=${FOLLOWER_FILE}:reload=30:fontcolor=white:fontsize=28:font=Sans:x=20:y=20:box=1:boxcolor=black@0.6:boxborderw=12"
 
           while true; do
             CURRENT_TIME=$(date +%s)
@@ -97,7 +119,7 @@ jobs:
                 -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow_id }}/dispatches" \
-                -d "{\"ref\":\"${{ github.ref_name }}\",\"inputs\":{\"action\":\"start\",\"stream_key\":\"${{ inputs.stream_key }}\",\"video_url\":\"${{ inputs.video_url }}\",\"kick_rtmp\":\"${{ inputs.kick_rtmp }}\",\"retrigger_hours\":\"${{ inputs.retrigger_hours }}\"}}"
+                -d "{\"ref\":\"${{ github.ref_name }}\",\"inputs\":{\"action\":\"start\",\"stream_key\":\"${{ inputs.stream_key }}\",\"video_url\":\"${{ inputs.video_url }}\",\"kick_username\":\"${{ inputs.kick_username }}\",\"kick_rtmp\":\"${{ inputs.kick_rtmp }}\",\"retrigger_hours\":\"${{ inputs.retrigger_hours }}\"}}"
               echo "Re-dispatch sent. This run will now stop."
               exit 0
             fi
@@ -110,6 +132,7 @@ jobs:
             echo "[$(date)] Starting FFmpeg stream..."
             ffmpeg -re -stream_loop -1 \
               -i /tmp/kick-stream/video.mp4 \
+              -vf "$DRAWTEXT" \
               -c:v libx264 -preset veryfast -b:v 4500k -maxrate 4500k -bufsize 9000k \
               -s 1920x1080 -r 30 \
               -c:a aac -b:a 128k -ar 44100 \
@@ -134,4 +157,5 @@ jobs:
         if: always()
         run: |
           pkill -f "ffmpeg.*push.kick.com" 2>/dev/null || true
+          pkill -f "get_followers.py" 2>/dev/null || true
           echo "Cleanup done."

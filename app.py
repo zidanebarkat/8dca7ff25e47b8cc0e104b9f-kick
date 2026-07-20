@@ -29,6 +29,7 @@ def load_config():
         "stream_key": "",
         "video_url": "",
         "kick_rtmp": KICK_RTMP,
+        "kick_username": "",
     }
 
 
@@ -105,6 +106,7 @@ input:focus{outline:none;border-color:#53dd6e}
 <div class="container">
 <div class="card"><h2>Stream Config</h2>
 <label>Kick Stream Key</label><input id="key" type="password" placeholder="your-kick-stream-key">
+<label>Kick Username (for follower count)</label><input id="username" placeholder="your-kick-username">
 <label>Video URL (mp4/m3u8)</label><input id="video" placeholder="https://example.com/video.mp4">
 <label>Kick RTMP URL</label><input id="rtmp" placeholder="rtmp://push.kick.com/live">
 <div class="btn-row">
@@ -125,12 +127,14 @@ let cfg={};
 async function load(){
   const r=await fetch('/api/config');cfg=await r.json();
   document.getElementById('key').value=cfg.stream_key||'';
+  document.getElementById('username').value=cfg.kick_username||'';
   document.getElementById('video').value=cfg.video_url||'';
   document.getElementById('rtmp').value=cfg.kick_rtmp||'rtmp://push.kick.com/live';
   update();
 }
 async function save(){
   cfg.stream_key=document.getElementById('key').value;
+  cfg.kick_username=document.getElementById('username').value;
   cfg.video_url=document.getElementById('video').value;
   cfg.kick_rtmp=document.getElementById('rtmp').value;
   await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});
@@ -186,20 +190,24 @@ def start_stream():
     stream_key = data.get("stream_key", "")
     video_url = data.get("video_url", "")
     kick_rtmp = data.get("kick_rtmp", KICK_RTMP)
+    kick_username = data.get("kick_username", "")
 
     if not stream_key:
         return jsonify({"error": "No stream key"}), 400
     if not video_url:
         return jsonify({"error": "No video URL"}), 400
 
-    save_config({"stream_key": stream_key, "video_url": video_url, "kick_rtmp": kick_rtmp})
+    save_config({"stream_key": stream_key, "video_url": video_url, "kick_rtmp": kick_rtmp, "kick_username": kick_username})
 
     STOP_FILE.unlink(missing_ok=True)
     env = os.environ.copy()
     env["KICK_RTMP"] = kick_rtmp
     script = os.path.join(os.path.dirname(__file__), "restream.sh")
+    cmd = ["bash", script, stream_key, video_url]
+    if kick_username:
+        cmd.append(kick_username)
     PROCESS = subprocess.Popen(
-        ["bash", script, stream_key, video_url],
+        cmd,
         preexec_fn=os.setsid,
         env=env,
     )
