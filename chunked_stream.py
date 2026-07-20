@@ -58,9 +58,13 @@ def stream(video_url, output_url):
             "--hls-live-restart",
         ]
 
-        ff_cmd = [
-            "ffmpeg",
-            "-re",
+        ff_cmd = ["ffmpeg", "-re"]
+
+        overlay = os.environ.get("OVERLAY_FILTER", "")
+        if overlay:
+            ff_cmd.extend(["-vf", overlay])
+
+        ff_cmd.extend([
             "-i", "pipe:0",
             "-c:v", "libx264", "-preset", "veryfast",
             "-b:v", "4500k", "-maxrate", "4500k", "-bufsize", "9000k",
@@ -68,12 +72,7 @@ def stream(video_url, output_url):
             "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
             "-f", "mpegts",
             output_url,
-        ]
-
-        overlay = os.environ.get("OVERLAY_FILTER", "")
-        if overlay:
-            ff_cmd.insert(2, "-vf")
-            ff_cmd.insert(3, overlay)
+        ])
 
         try:
             sl_proc = subprocess.Popen(
