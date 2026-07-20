@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Streamlink -> FFmpeg pipe.
-Downloads HLS segments on-the-fly via Streamlink,
-pipes directly into FFmpeg which streams to Kick.
-Auto-reconnects on failure. No disk space needed for video.
+Direct FFmpeg m3u8 -> SRT/RTMP pipe.
+No Streamlink, no yt-dlp at runtime.
+Gets m3u8 URL via yt-dlp once, then FFmpeg reads it directly.
+Auto-reconnects on failure.
 """
 
 import os
@@ -11,6 +11,8 @@ import sys
 import subprocess
 import signal
 import time
+import json
+import urllib.request
 
 STOP_FILE = "/tmp/kick-stream.stop"
 LOG_FILE = "/tmp/kick-stream/stream.log"
@@ -38,7 +40,36 @@ signal.signal(signal.SIGTERM, signal_handler)
 signal.signal(signal.SIGINT, signal_handler)
 
 
-def stream(video_url, output_url):
+def get_stream_url(video_url):
+    log(f"Resolving stream URL for: {video_url}")
+
+    result = subprocess.run(
+        ["yt-dlp", "-g", "--no-warnings", video_url],
+        capture_output=True, text=True, timeout=60
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        url = result.stdout.strip().split("\n")[0]
+        log(f"Got m3u8 URL: {url[:80]}...")
+        return url
+
+    log(f"yt-dlp failed: {result.stderr[:200]}")
+
+    try:
+        result = subprocess.run(
+            ["streamlink", "--stream-url", video_url, "best"],
+            capture_output=True, text=True, timeout=30
+        )
+        url = result.stdout.strip()
+        if url.startswith("http"):
+            log(f"Got URL via streamlink: {url[:80]}...")
+            return url
+    except Exception as e:
+        log(f"streamlink failed: {e}")
+
+    return None
+
+
+def stream(m3u8_url, output_url):
     global running
     attempt = 0
 
@@ -48,19 +79,12 @@ def stream(video_url, output_url):
             break
 
         attempt += 1
-        log(f"Attempt {attempt}: Streamlink -> FFmpeg -> {output_url[:50]}...")
-
-        sl_cmd = [
-            "streamlink",
-            video_url, "best",
-            "--stdout",
-            "--twitch-disable-ads",
-            "--hls-live-restart",
-        ]
+        log(f"Attempt {attempt}: FFmpeg m3u8 -> {output_url[:60]}...")
 
         ff_cmd = [
             "ffmpeg", "-re",
-            "-i", "pipe:0",
+            "-rw_timeout", "15000000",
+            "-i", m3u8_url,
         ]
 
         overlay = os.environ.get("OVERLAY_FILTER", "")
@@ -77,50 +101,29 @@ def stream(video_url, output_url):
         ])
 
         try:
-            sl_proc = subprocess.Popen(
-                sl_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-            ff_proc = subprocess.Popen(
+            proc = subprocess.Popen(
                 ff_cmd,
-                stdin=sl_proc.stdout,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-
-            sl_proc.stdout.close()
 
             while running:
                 if os.path.exists(STOP_FILE):
-                    log("Stop file detected, killing processes...")
-                    sl_proc.kill()
-                    ff_proc.kill()
+                    log("Stop file detected, killing FFmpeg...")
+                    proc.kill()
                     return
 
-                if ff_proc.poll() is not None:
-                    stderr = ff_proc.stderr.read().decode(errors="replace")[-300:]
-                    log(f"FFmpeg exited {ff_proc.returncode}: {stderr}")
-                    sl_proc.kill()
+                if proc.poll() is not None:
+                    stderr = proc.stderr.read().decode(errors="replace")[-400:]
+                    log(f"FFmpeg exited {proc.returncode}: {stderr}")
                     break
 
-                if sl_proc.poll() is not None:
-                    stderr_out = sl_proc.stderr.read().decode(errors="replace")[-200:]
-                    log(f"Streamlink exited {sl_proc.returncode}: {stderr_out}")
-                    ff_proc.kill()
-                    break
-
-                time.sleep(2)
+                time.sleep(3)
 
         except Exception as e:
             log(f"Error: {e}")
             try:
-                sl_proc.kill()
-            except Exception:
-                pass
-            try:
-                ff_proc.kill()
+                proc.kill()
             except Exception:
                 pass
 
@@ -147,4 +150,9 @@ if __name__ == "__main__":
     if os.path.exists(STOP_FILE):
         os.remove(STOP_FILE)
 
-    stream(video_url, output_url)
+    m3u8_url = get_stream_url(video_url)
+    if not m3u8_url:
+        log("ERROR: Could not resolve stream URL")
+        sys.exit(1)
+
+    stream(m3u8_url, output_url)
