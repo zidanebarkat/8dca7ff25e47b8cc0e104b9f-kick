@@ -58,14 +58,16 @@ def stream(video_url, output_url):
             "--hls-live-restart",
         ]
 
-        ff_cmd = ["ffmpeg", "-re"]
+        ff_cmd = [
+            "ffmpeg", "-re",
+            "-i", "pipe:0",
+        ]
 
         overlay = os.environ.get("OVERLAY_FILTER", "")
         if overlay:
             ff_cmd.extend(["-vf", overlay])
 
         ff_cmd.extend([
-            "-i", "pipe:0",
             "-c:v", "libx264", "-preset", "veryfast",
             "-b:v", "4500k", "-maxrate", "4500k", "-bufsize", "9000k",
             "-s", "1920x1080", "-r", "30",
