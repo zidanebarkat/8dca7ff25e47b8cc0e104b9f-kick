@@ -97,9 +97,12 @@ def stream(m3u8_url, output_url):
         ff_cmd.extend([
             "-c:v", "libx264", "-preset", "veryfast",
             "-tune", "zerolatency",
+            "-profile:v", "high", "-level", "4.1",
             "-b:v", "4500k", "-maxrate", "4500k", "-bufsize", "9000k",
             "-s", "1920x1080", "-r", "30",
-            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-pix_fmt", "yuv420p",
+            "-g", "60",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
             "-max_muxing_queue_size", "1024",
             "-flush_packets", "1",
         ])
@@ -107,7 +110,7 @@ def stream(m3u8_url, output_url):
         if "srt://" in output_url:
             ff_cmd.extend([
                 "-f", "mpegts",
-                output_url,
+                "srt://" + output_url.split("srt://", 1)[1],
             ])
         else:
             ff_cmd.extend([
