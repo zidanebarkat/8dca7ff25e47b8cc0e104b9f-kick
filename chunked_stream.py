@@ -107,8 +107,6 @@ def stream(m3u8_url, output_url):
         if "srt://" in output_url:
             ff_cmd.extend([
                 "-f", "mpegts",
-                "-srt_persistent", "1",
-                "-srt_loglevel", "warn",
                 output_url,
             ])
         else:
