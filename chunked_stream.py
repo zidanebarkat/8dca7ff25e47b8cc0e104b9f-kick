@@ -84,6 +84,9 @@ def stream(m3u8_url, output_url):
         ff_cmd = [
             "ffmpeg", "-re",
             "-rw_timeout", "15000000",
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "5",
             "-i", m3u8_url,
         ]
 
@@ -93,12 +96,26 @@ def stream(m3u8_url, output_url):
 
         ff_cmd.extend([
             "-c:v", "libx264", "-preset", "veryfast",
+            "-tune", "zerolatency",
             "-b:v", "4500k", "-maxrate", "4500k", "-bufsize", "9000k",
             "-s", "1920x1080", "-r", "30",
             "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-            "-f", "mpegts",
-            output_url,
+            "-max_muxing_queue_size", "1024",
+            "-flush_packets", "1",
         ])
+
+        if "srt://" in output_url:
+            ff_cmd.extend([
+                "-f", "mpegts",
+                "-srt_persistent", "1",
+                "-srt_loglevel", "warn",
+                output_url,
+            ])
+        else:
+            ff_cmd.extend([
+                "-f", "flv",
+                output_url,
+            ])
 
         try:
             proc = subprocess.Popen(
